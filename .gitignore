@@ -1,0 +1,34 @@
+.venv/
+build/
+output/
+.env
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+
+
+# Distribution/build artifacts
+dist/
+*.egg-info/
+
+# Output and debug artifacts
+sei_extractor.log
+
+# Playwright browser cache (Linux/macOS)
+~/.cache/ms-playwright/
+
+# Environment and secrets
+.env.example
+
+# OS/Editor files
+.DS_Store
+*.swp
+*.swo
+*.bak
+Thumbs.db
+

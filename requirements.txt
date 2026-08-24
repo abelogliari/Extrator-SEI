@@ -1,0 +1,8 @@
+playwright
+pymupdf
+requests
+beautifulsoup4
+pandas
+tqdm
+python-dotenv
+python-dateutil

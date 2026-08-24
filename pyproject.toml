@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sei_extractor"
+version = "0.1.0"
+description = "An independent SEI data extractor."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "playwright",
+    "pymupdf",
+    "requests",
+    "beautifulsoup4",
+    "pandas",
+    "tqdm",
+    "python-dotenv",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+sei-extractor = "sei_extractor.cli:main"

@@ -1,0 +1,28 @@
+# Python virtualenv and build artifacts
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Output and debug artifacts
+output/
+sei_extractor.log
+
+# Playwright browser cache (Linux/macOS)
+~/.cache/ms-playwright/
+
+# Environment and secrets
+.env
+.env.example
+
+# OS/Editor files
+.DS_Store
+*.swp
+*.swo
+*.bak
+Thumbs.db
