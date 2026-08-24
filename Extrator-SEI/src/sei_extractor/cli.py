@@ -19,13 +19,16 @@ from sei_extractor.services import JSONToCSVService
 console = Console()
 
 
-def load_process_list(file_path: str) -> List[str]:
-    """Carrega lista de processos de um arquivo (um por linha ou JSON array)."""
+def load_process_list_safe(file_path: str) -> List[str]:
+    """Carrega lista de processos de um arquivo (um por linha ou JSON array).
+
+    Levanta exceções em vez de encerrar o processo, para poder ser reutilizada
+    fora do CLI (ex.: pela interface gráfica).
+    """
     path = Path(file_path)
 
     if not path.exists():
-        console.print(f"[red]Error: File not found: {file_path}[/red]")
-        sys.exit(1)
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     content = path.read_text(encoding='utf-8').strip()
 
@@ -40,6 +43,15 @@ def load_process_list(file_path: str) -> List[str]:
     # Se não for JSON, tratar como texto (um processo por linha)
     processes = [line.strip() for line in content.split('\n') if line.strip()]
     return processes
+
+
+def load_process_list(file_path: str) -> List[str]:
+    """Carrega lista de processos de um arquivo, encerrando o CLI em caso de erro."""
+    try:
+        return load_process_list_safe(file_path)
+    except FileNotFoundError:
+        console.print(f"[red]Error: File not found: {file_path}[/red]")
+        sys.exit(1)
 
 
 def cmd_extract(args):

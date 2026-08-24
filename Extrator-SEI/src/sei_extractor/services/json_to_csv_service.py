@@ -156,16 +156,6 @@ class JSONToCSVService:
         interessados = data.get('interessados', [])
         flat.update(self.flatten_list_field(interessados, 'interessado'))
 
-        # Processos relacionados
-        proc_rel = data.get('processos_relacionados', [])
-        flat['processos_relacionados_count'] = len(proc_rel)
-        if proc_rel:
-            flat['processos_relacionados_lista'] = " | ".join(str(p) for p in proc_rel)
-            flat['processos_relacionados_completo_json'] = json.dumps(proc_rel, ensure_ascii=False)
-        else:
-            flat['processos_relacionados_lista'] = ''
-            flat['processos_relacionados_completo_json'] = '[]'
-
         # Observações
         flat.update(self.process_observacoes(data.get('observacoes', [])))
 
@@ -266,7 +256,7 @@ class JSONToCSVService:
                 remaining.remove(field)
 
         # Depois assuntos, interessados, etc
-        for prefix in ['assunto', 'interessado', 'processos_relacionados', 'observacoes', 'anexos', 'historico']:
+        for prefix in ['assunto', 'interessado', 'observacoes', 'anexos', 'historico']:
             prefix_cols = sorted([c for c in remaining if c.startswith(prefix)])
             ordered.extend(prefix_cols)
             remaining -= set(prefix_cols)

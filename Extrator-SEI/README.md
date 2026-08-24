@@ -67,6 +67,14 @@ Note: The Dockerfile runs `playwright install --with-deps chromium` during image
   python -m sei_extractor sync --threads 10
   ```
 
+### GUI (CustomTkinter)
+A desktop panel is available to run the same commands (extract, debug, status, convert-csv) and to browse every script/function of the project:
+```bash
+python -m sei_extractor.gui
+# or, if installed as a package:
+sei-extractor-gui
+```
+
 ### Environment Variables
 Create a `.env` file with the following variables:
 ```

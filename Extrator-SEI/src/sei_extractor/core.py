@@ -19,7 +19,6 @@ from .parser import (
     get_interessados,
     get_observacoes,
     get_anexos,
-    get_processos_relacionados,
 )
 from bs4 import BeautifulSoup
 
@@ -131,6 +130,34 @@ class SEI:
         except Exception:
             pass
 
+    def select_unidade(self, sigla: str) -> bool:
+        """Troca a unidade ativa no SEI para a unidade cuja sigla contenha `sigla`.
+
+        No topo do SEI a unidade atual é um `<select id="selInfraUnidade">` com uma
+        opção por unidade (ex.: "CGCUSTOS (MS)"). Aceita a sigla parcial ou completa
+        (ex.: "CGCUSTOS" ou "CGCUSTOS (MS)") e seleciona a primeira opção cujo texto
+        contenha o valor informado.
+        """
+        if not sigla:
+            return False
+
+        select = self._page.locator('#selInfraUnidade')
+        try:
+            select.wait_for(state='visible', timeout=5000)
+        except Exception:
+            return False
+
+        alvo = sigla.strip().lower()
+        options = select.locator('option')
+        for i in range(options.count()):
+            option = options.nth(i)
+            texto = (option.text_content() or '').strip()
+            if alvo in texto.lower():
+                select.select_option(label=texto)
+                return True
+
+        return False
+
     def search(self, value: str):
         self._ensure_browser()
         self._page.locator('xpath=//*[@id="txtPesquisaRapida"]').fill(value)
@@ -170,7 +197,6 @@ class SEI:
         frame_arvore = self._navigator.get_frame('ifrArvore')
         soup_arvore = BeautifulSoup(frame_arvore.content(), 'html.parser')
         anexos = get_anexos(soup_arvore)
-        processos_relacionados = get_processos_relacionados(soup_arvore)
 
         return {
             'protocolo': numero_processo,
@@ -180,7 +206,6 @@ class SEI:
             'interessados': interessados,
             'observacoes': observacoes,
             'anexos': anexos,
-            'processos_relacionados': processos_relacionados,
         }
 
     def get_historico(self):

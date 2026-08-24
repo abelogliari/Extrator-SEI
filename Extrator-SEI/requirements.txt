@@ -6,3 +6,5 @@ pandas
 tqdm
 python-dotenv
 python-dateutil
+rich
+customtkinter

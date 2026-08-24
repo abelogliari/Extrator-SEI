@@ -66,11 +66,6 @@ def get_anexos(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return anexos
 
 
-def get_processos_relacionados(soup: BeautifulSoup) -> List[str]:
-    el_relacionados = soup.find_all('p', class_='cardTitleRelacionado')
-    return [el_relacionado.get_text().replace('.', '').replace('/', '').replace('-', '') for el_relacionado in el_relacionados]
-
-
 def parse_metadata_from_frames(ifr_visualizacao_content: str, ifr_arvore_content: str, numero_processo: str) -> Dict[str, Any]:
     from bs4 import BeautifulSoup
     soup_vis = BeautifulSoup(ifr_visualizacao_content, 'html.parser')
@@ -82,7 +77,6 @@ def parse_metadata_from_frames(ifr_visualizacao_content: str, ifr_arvore_content
     interessados = get_interessados(soup_vis)
     observacoes = get_observacoes(soup_vis)
     anexos = get_anexos(soup_arv)
-    processos_relacionados = get_processos_relacionados(soup_arv)
 
     return {
         'protocolo': numero_processo,
@@ -92,5 +86,4 @@ def parse_metadata_from_frames(ifr_visualizacao_content: str, ifr_arvore_content
         'interessados': interessados,
         'observacoes': observacoes,
         'anexos': anexos,
-        'processos_relacionados': processos_relacionados,
     }
