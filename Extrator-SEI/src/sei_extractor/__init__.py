@@ -1,1 +1,0 @@
-# This file ensures the sei_extractor directory is treated as a Python package.
