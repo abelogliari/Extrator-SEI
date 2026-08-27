@@ -54,6 +54,8 @@ SEI_URL = "https://sei.saude.gov.br/"
 SEI_USERNAME = os.getenv("SEI_USERNAME")
 SEI_PASSWORD = os.getenv("SEI_PASSWORD")
 THREADS = int(os.getenv("THREADS", 10))
+THREADS_MIN = 1
+THREADS_MAX = 20
 HEADLESS = os.getenv("HEADLESS", "True").lower() in ("true", "1", "t")
 
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
@@ -657,6 +659,7 @@ class SEIExtractor:
         save_pdf_files: bool = False,
         save_zip_files: bool = False,
         output_dir: Optional[str] = None,
+        threads: Optional[int] = None,
     ):
         self.url = url or SEI_URL
         self.user = user or SEI_USERNAME
@@ -664,6 +667,7 @@ class SEIExtractor:
         self.sigla = sigla or ""
         self.save_pdf_files = save_pdf_files
         self.save_zip_files = save_zip_files
+        self.threads = threads if threads and threads > 0 else THREADS
 
         self.output_dir = output_dir or OUTPUT_DIR
         self.json_dir = os.path.join(self.output_dir, "json")
@@ -698,7 +702,7 @@ class SEIExtractor:
 
         # Não abre mais threads do que processos pendentes: buscar 1 processo
         # não precisa logar 10 vezes no SEI.
-        num_threads = max(1, min(THREADS, self.work_queue.qsize()))
+        num_threads = max(1, min(self.threads, self.work_queue.qsize()))
         logger.info(f"Iniciando extração de {len(process_numbers)} processo(s) com {num_threads} thread(s)")
 
         with Progress(
@@ -1204,6 +1208,32 @@ def load_nups_from_csv(path: str) -> List[str]:
     return nups
 
 
+def load_nups_from_excel(path: str) -> List[str]:
+    """Lê uma planilha Excel (.xlsx/.xls) e devolve a lista de NUPs.
+
+    Mesma lógica de coluna do load_nups_from_csv: procura uma coluna com
+    nome reconhecido (nup/nups/processo/...); se não encontrar, usa a
+    1ª coluna da planilha.
+    """
+    df = pd.read_excel(path, dtype=str)
+    if df.empty:
+        return []
+
+    columns_lower = [str(c).strip().lower() for c in df.columns]
+    col_index = next((i for i, name in enumerate(columns_lower) if name in NUP_COLUMN_NAMES), 0)
+
+    values = df.iloc[:, col_index].dropna().astype(str).str.strip()
+    return [v for v in values if v]
+
+
+def load_nups_from_file(path: str) -> List[str]:
+    """Lê um CSV ou Excel e devolve a lista de NUPs, conforme a extensão."""
+    ext = Path(path).suffix.lower()
+    if ext in (".xlsx", ".xls"):
+        return load_nups_from_excel(path)
+    return load_nups_from_csv(path)
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -1275,6 +1305,12 @@ class App(ctk.CTk):
             text_color=C_TEXT,
         )
         self.tabview.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 8))
+
+        tab_login = self.tabview.add("Login")
+        self._build_login_tab(tab_login)
+
+        tab_especificacoes = self.tabview.add("Especificações")
+        self._build_especificacoes_tab(tab_especificacoes)
 
         tab_extracao = self.tabview.add("Extração")
         self._build_extracao_tab(tab_extracao)
@@ -1381,18 +1417,15 @@ class App(ctk.CTk):
         self.destroy()
 
     # ------------------------------------------------------------------
-    # Aba: Extração
+    # Aba: Login
     # ------------------------------------------------------------------
-    def _build_extracao_tab(self, tab):
-        # Aba rolável: garante que todas as seções (inclusive o botão de
-        # executar, no fim) fiquem acessíveis mesmo se a janela for pequena
-        # demais para exibir tudo de uma vez.
+    def _build_login_tab(self, tab):
+        # Aba rolável: garante que todas as seções fiquem acessíveis mesmo
+        # se a janela for pequena demais para exibir tudo de uma vez.
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
 
         self._build_credentials_section(scroll)
-        self._build_nups_section(scroll)
-        self._build_run_section(scroll)
 
     def _build_credentials_section(self, tab):
         card = ctk.CTkFrame(tab, fg_color=C_SURFACE, corner_radius=8, border_width=1, border_color=C_BORDER)
@@ -1440,16 +1473,27 @@ class App(ctk.CTk):
     def _toggle_password_visibility(self):
         self.password_entry.configure(show="" if self.show_password_var.get() else "*")
 
+    # ------------------------------------------------------------------
+    # Aba: Especificações
+    # ------------------------------------------------------------------
+    def _build_especificacoes_tab(self, tab):
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+
+        self._build_nups_section(scroll)
+        self._build_output_options_section(scroll)
+
     def _build_nups_section(self, tab):
         card = ctk.CTkFrame(tab, fg_color=C_SURFACE, corner_radius=8, border_width=1, border_color=C_BORDER)
-        card.pack(fill="both", expand=True, padx=14, pady=8)
+        card.pack(fill="x", padx=14, pady=(12, 8))
 
         ctk.CTkLabel(
             card, text="Processos (NUPs)", font=ctk.CTkFont(size=14, weight="bold"), text_color=C_TEXT
         ).pack(anchor="w", padx=14, pady=(12, 2))
         ctk.CTkLabel(
             card,
-            text="Carregue um ou mais arquivos CSV com a lista de NUPs a extrair.",
+            text="Carregue um ou mais arquivos CSV ou Excel com a lista de NUPs a extrair "
+                 "(uma única coluna, com o título \"NUPs\").",
             font=ctk.CTkFont(size=12),
             text_color=C_MUTED,
         ).pack(anchor="w", padx=14, pady=(0, 8))
@@ -1458,8 +1502,8 @@ class App(ctk.CTk):
         row.pack(fill="x", padx=14)
 
         load_btn = ctk.CTkButton(
-            row, text="Selecionar CSV...", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER,
-            command=self._pick_csv_files,
+            row, text="Selecionar CSV/Excel...", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER,
+            command=self._pick_nup_files,
         )
         load_btn.pack(side="left")
         self._busy_widgets.append(load_btn)
@@ -1478,22 +1522,25 @@ class App(ctk.CTk):
             anchor="w", padx=14, pady=(10, 2)
         )
         self.single_nup_entry = ctk.CTkEntry(card, width=280, placeholder_text="25000.123456/2023-45")
-        self.single_nup_entry.pack(anchor="w", padx=14, pady=(0, 8))
+        self.single_nup_entry.pack(anchor="w", padx=14, pady=(0, 14))
         self._busy_widgets.append(self.single_nup_entry)
 
-        self.nups_preview = ctk.CTkTextbox(card, fg_color=C_BG, text_color=C_TEXT, height=120, wrap="none")
-        self.nups_preview.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self.nups_preview.configure(state="disabled")
-
-    def _pick_csv_files(self):
-        paths = filedialog.askopenfilenames(filetypes=[("CSV", "*.csv"), ("Todos", "*.*")])
+    def _pick_nup_files(self):
+        paths = filedialog.askopenfilenames(
+            filetypes=[
+                ("CSV ou Excel", "*.csv *.xlsx *.xls"),
+                ("CSV", "*.csv"),
+                ("Excel", "*.xlsx *.xls"),
+                ("Todos", "*.*"),
+            ]
+        )
         if not paths:
             return
 
         novos = []
         for path in paths:
             try:
-                novos.extend(load_nups_from_csv(path))
+                novos.extend(load_nups_from_file(path))
             except Exception as exc:
                 messagebox.showerror("SEI Extractor", f"Erro ao ler {Path(path).name}: {exc}")
                 return
@@ -1506,23 +1553,30 @@ class App(ctk.CTk):
             if nup not in self._loaded_nups:
                 self._loaded_nups.append(nup)
 
-        self._refresh_nups_preview(len(paths))
+        self._refresh_nups_summary(len(paths))
 
     def _clear_nups(self):
         self._loaded_nups = []
-        self._refresh_nups_preview(0)
+        self._refresh_nups_summary(0)
 
-    def _refresh_nups_preview(self, files_loaded: int):
+    def _refresh_nups_summary(self, files_loaded: int):
         total = len(self._loaded_nups)
         if total:
             self.nups_summary_label.configure(text=f"{total} processo(s) carregado(s) de {files_loaded} arquivo(s)")
         else:
             self.nups_summary_label.configure(text="Nenhum processo carregado")
 
-        self.nups_preview.configure(state="normal")
-        self.nups_preview.delete("1.0", "end")
-        self.nups_preview.insert("end", "\n".join(self._loaded_nups))
-        self.nups_preview.configure(state="disabled")
+    def _get_threads(self) -> int:
+        try:
+            value = int(self.threads_var.get())
+        except (ValueError, AttributeError):
+            value = THREADS
+        return max(THREADS_MIN, min(THREADS_MAX, value))
+
+    def _step_threads(self, delta: int):
+        novo_valor = self._get_threads() + delta
+        novo_valor = max(THREADS_MIN, min(THREADS_MAX, novo_valor))
+        self.threads_var.set(str(novo_valor))
 
     def _pick_output_dir(self):
         path = filedialog.askdirectory(title="Escolher pasta de saída")
@@ -1530,12 +1584,16 @@ class App(ctk.CTk):
             self.output_dir_entry.delete(0, "end")
             self.output_dir_entry.insert(0, path)
 
-    def _build_run_section(self, tab):
-        card = ctk.CTkFrame(tab, fg_color="transparent")
-        card.pack(fill="x", padx=14, pady=(0, 12))
+    def _build_output_options_section(self, tab):
+        card = ctk.CTkFrame(tab, fg_color=C_SURFACE, corner_radius=8, border_width=1, border_color=C_BORDER)
+        card.pack(fill="x", padx=14, pady=8)
+
+        ctk.CTkLabel(
+            card, text="Opções de extração", font=ctk.CTkFont(size=14, weight="bold"), text_color=C_TEXT
+        ).pack(anchor="w", padx=14, pady=(12, 8))
 
         output_row = ctk.CTkFrame(card, fg_color="transparent")
-        output_row.pack(fill="x", pady=(0, 8))
+        output_row.pack(fill="x", padx=14, pady=(0, 8))
 
         ctk.CTkLabel(output_row, text="Pasta de saída:").pack(side="left")
 
@@ -1551,8 +1609,37 @@ class App(ctk.CTk):
         output_dir_btn.pack(side="left")
         self._busy_widgets.append(output_dir_btn)
 
+        threads_row = ctk.CTkFrame(card, fg_color="transparent")
+        threads_row.pack(anchor="w", padx=14, pady=(0, 8))
+
+        ctk.CTkLabel(threads_row, text="Quantidade de threads:").pack(side="left")
+
+        self.threads_var = ctk.StringVar(value=str(THREADS))
+
+        threads_minus_btn = ctk.CTkButton(
+            threads_row, text="-", width=28, fg_color=C_BG, text_color=C_TEXT, hover_color=C_BORDER,
+            command=lambda: self._step_threads(-1),
+        )
+        threads_minus_btn.pack(side="left", padx=(8, 0))
+        self._busy_widgets.append(threads_minus_btn)
+
+        self.threads_entry = ctk.CTkEntry(threads_row, width=50, justify="center", textvariable=self.threads_var)
+        self.threads_entry.pack(side="left", padx=4)
+        self._busy_widgets.append(self.threads_entry)
+
+        threads_plus_btn = ctk.CTkButton(
+            threads_row, text="+", width=28, fg_color=C_BG, text_color=C_TEXT, hover_color=C_BORDER,
+            command=lambda: self._step_threads(1),
+        )
+        threads_plus_btn.pack(side="left")
+        self._busy_widgets.append(threads_plus_btn)
+
+        ctk.CTkLabel(
+            threads_row, text=f"(máx. {THREADS_MAX})", font=ctk.CTkFont(size=12), text_color=C_MUTED,
+        ).pack(side="left", padx=(8, 0))
+
         options_row = ctk.CTkFrame(card, fg_color="transparent")
-        options_row.pack(anchor="w", pady=(0, 8))
+        options_row.pack(anchor="w", padx=14, pady=(0, 14))
 
         self.save_pdf_var = ctk.BooleanVar(value=False)
         pdf_check = ctk.CTkCheckBox(
@@ -1569,6 +1656,19 @@ class App(ctk.CTk):
         )
         zip_check.pack(side="left")
         self._busy_widgets.append(zip_check)
+
+    # ------------------------------------------------------------------
+    # Aba: Extração
+    # ------------------------------------------------------------------
+    def _build_extracao_tab(self, tab):
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+
+        self._build_run_section(scroll)
+
+    def _build_run_section(self, tab):
+        card = ctk.CTkFrame(tab, fg_color="transparent")
+        card.pack(fill="x", padx=14, pady=(12, 12))
 
         run_btn = ctk.CTkButton(
             card, text="Executar extração", fg_color=C_GREEN, hover_color="#0F5C17",
@@ -1624,9 +1724,11 @@ class App(ctk.CTk):
 
         save_pdf_files = self.save_pdf_var.get()
         save_zip_files = self.save_zip_var.get()
+        threads = self._get_threads()
+        self.threads_var.set(str(threads))
 
         self.log(
-            f"Iniciando extração de {len(processes)} processo(s)"
+            f"Iniciando extração de {len(processes)} processo(s) com {threads} thread(s)"
             + (f" na unidade '{sigla}'" if sigla else "")
             + (" [PDF]" if save_pdf_files else "")
             + (" [ZIP]" if save_zip_files else "")
@@ -1646,7 +1748,7 @@ class App(ctk.CTk):
             extractor = SEIExtractor(
                 on_progress=_on_progress, url=url, user=user, passw=passw, sigla=sigla,
                 save_pdf_files=save_pdf_files, save_zip_files=save_zip_files,
-                output_dir=output_dir,
+                output_dir=output_dir, threads=threads,
             )
             extractor.run(processes)
 

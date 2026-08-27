@@ -10,7 +10,7 @@ __pycache__/
 *.pyd
 *.pdb
 
-
+/output
 
 # Distribution/build artifacts
 dist/
