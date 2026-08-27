@@ -60,6 +60,11 @@ HEADLESS = os.getenv("HEADLESS", "True").lower() in ("true", "1", "t")
 
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 
+# Tempo máximo (ms) para qualquer ação/espera do Playwright sem timeout explícito.
+# Faz com que uma thread travada (ex.: elemento que nunca aparece, página que não
+# carrega) estoure uma exceção em vez de travar indefinidamente.
+PAGE_DEFAULT_TIMEOUT_MS = 120_000
+
 LOG_FILE = "sei_extractor.log"
 logger = logging.getLogger("sei_extractor")
 logger.setLevel(logging.INFO)
@@ -361,7 +366,14 @@ class SEI:
         if self._external_playwright:
             self._browser = self._p.chromium.launch(headless=self._headless)
             self._page = self._browser.new_page()
+            self._apply_default_timeouts()
             self._navigator = Navigator(self._page, debug=self._debug, dumper=self._dumper)
+
+    def _apply_default_timeouts(self):
+        # Sem isso, uma ação do Playwright sem timeout explícito (ex.: click,
+        # wait_for_load_state) pode travar a thread indefinidamente.
+        self._page.set_default_timeout(PAGE_DEFAULT_TIMEOUT_MS)
+        self._page.set_default_navigation_timeout(PAGE_DEFAULT_TIMEOUT_MS)
 
     @property
     def current_url(self) -> str:
@@ -373,6 +385,7 @@ class SEI:
         self._p = sync_playwright().start()
         self._browser = self._p.chromium.launch(headless=self._headless, args=["--no-sandbox"])
         self._page = self._browser.new_page()
+        self._apply_default_timeouts()
         self._navigator = Navigator(self._page, debug=self._debug, dumper=self._dumper)
 
     def close(self):
@@ -649,6 +662,12 @@ class SEI:
 # Extractor
 # ==============================================================================
 class SEIExtractor:
+    # Número máximo de tentativas por NUP (incluindo travamentos, que são
+    # tratados como uma falha normal graças ao PAGE_DEFAULT_TIMEOUT_MS).
+    # Após esgotar as tentativas, o NUP é abandonado e a thread segue para o
+    # próximo item da fila.
+    MAX_ATTEMPTS = 3
+
     def __init__(
         self,
         on_progress: Optional[Callable[[int, int], None]] = None,
@@ -685,19 +704,61 @@ class SEIExtractor:
         self.thread_tasks: Dict[int, Any] = {}
         self.on_progress = on_progress
 
+        # Controle de finalização manual (botão "Finalizar extração") e de
+        # travamento/relogin por thread.
+        self.stop_event = threading.Event()
+        self.thread_seis: Dict[int, "SEI"] = {}
+        self.original_process_numbers: List[str] = []
+        self.results: Dict[str, bool] = {}
+
     @staticmethod
     def clean_process_number(number) -> str:
         """Remove formatação do número do processo."""
         return number.replace('/', '').replace('.', '').replace('-', '')
 
+    def request_stop(self):
+        """Interrompe a extração: sinaliza as threads e fecha os navegadores ativos.
+
+        Fechar o navegador de uma thread que esteja bloqueada numa chamada do
+        Playwright faz essa chamada estourar uma exceção, liberando a thread
+        para notar o stop_event e encerrar (em vez de esperar a thread inteira
+        travada por até PAGE_DEFAULT_TIMEOUT_MS).
+        """
+        self.stop_event.set()
+        with self.lock:
+            seis = list(self.thread_seis.values())
+        for sei in seis:
+            threading.Thread(target=self._safe_close_sei, args=(sei,), daemon=True).start()
+
+    @staticmethod
+    def _safe_close_sei(sei):
+        try:
+            sei.close()
+        except Exception:
+            pass
+
+    def build_report_dataframe(self) -> pd.DataFrame:
+        """Monta o relatório com todos os NUPs solicitados e se foram extraídos."""
+        rows = [
+            {"NUP": nup, "Extraído": "Sim" if self.results.get(nup) else "Não"}
+            for nup in self.original_process_numbers
+        ]
+        return pd.DataFrame(rows)
+
     def run(self, process_numbers):
         """Processa usando uma fila compartilhada - threads pegam trabalho dinamicamente (work stealing)."""
         self.work_queue = queue.Queue()
+        self.stop_event.clear()
+        self.original_process_numbers = list(process_numbers)
+        self.results = {}
 
         for process_num in process_numbers:
             output_file = Path(self.json_dir, f"{self.clean_process_number(process_num)}.json")
 
-            if not output_file.exists():
+            if output_file.exists():
+                self.results[process_num] = True
+            else:
+                self.results[process_num] = False
                 self.work_queue.put(process_num)
 
         # Não abre mais threads do que processos pendentes: buscar 1 processo
@@ -737,17 +798,23 @@ class SEIExtractor:
 
         logger.info("Extração concluída")
 
-    def _process_from_queue(self, thread_index):
-        """Thread worker que consome processos da fila compartilhada até ela estar vazia."""
-        thread_task = self.thread_tasks[thread_index]
-        processed_count = 0
+    def _login_with_retry(self, thread_index: int) -> bool:
+        """Abre navegador e faz login, tentando novamente em caso de falha/travamento.
 
-        with sync_playwright() as p:
-            sei = SEI(self.url, self.user, self.passw, p, headless=HEADLESS)
+        Cada tentativa cria um navegador novo (a anterior, se travada, já
+        estourou uma exceção graças ao PAGE_DEFAULT_TIMEOUT_MS da página).
+        """
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            if self.stop_event.is_set():
+                return False
+
+            sei = SEI(self.url, self.user, self.passw, headless=HEADLESS)
             try:
-                logger.info(f"[Thread {thread_index + 1}] Abrindo navegador e fazendo login em {self.url}...")
+                logger.info(
+                    f"[Thread {thread_index + 1}] Abrindo navegador e fazendo login em "
+                    f"{self.url}... (tentativa {attempt}/{self.MAX_ATTEMPTS})"
+                )
                 sei.do_login()
-                logger.info(f"[Thread {thread_index + 1}] Login efetuado")
 
                 if self.sigla:
                     # select_unidade já loga o resultado (trocou, não precisou
@@ -755,57 +822,119 @@ class SEIExtractor:
                     sei.select_unidade(self.sigla)
 
                 with self.lock:
-                    self.progress.update(thread_task, visible=True)
+                    self.thread_seis[thread_index] = sei
+                logger.info(f"[Thread {thread_index + 1}] Login efetuado")
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"[Thread {thread_index + 1}] Falha ao fazer login "
+                    f"(tentativa {attempt}/{self.MAX_ATTEMPTS}): {e}"
+                )
+                self._safe_close_sei(sei)
+                time.sleep(2)
 
-                while True:
-                    try:
-                        process_number = self.work_queue.get(timeout=1)
+        logger.error(f"[Thread {thread_index + 1}] Não foi possível fazer login após {self.MAX_ATTEMPTS} tentativas.")
+        return False
 
-                        with self.lock:
-                            current_total_thread = self.progress.tasks[thread_task].total
-                            current_total_overall = self.progress.tasks[self.overall_task].total
-                            self.progress.update(thread_task, total=current_total_thread + 1)
-                            self.progress.update(self.overall_task, total=current_total_overall + 1)
+    def _relogin(self, thread_index: int) -> bool:
+        """Fecha a sessão atual da thread (se houver) e faz login novamente."""
+        with self.lock:
+            old_sei = self.thread_seis.get(thread_index)
+        if old_sei:
+            self._safe_close_sei(old_sei)
 
-                        success = self.process(process_number, sei)
-                        processed_count += 1
+        sei = SEI(self.url, self.user, self.passw, headless=HEADLESS)
+        try:
+            sei.do_login()
+            if self.sigla:
+                sei.select_unidade(self.sigla)
+            with self.lock:
+                self.thread_seis[thread_index] = sei
+            logger.info("Login refeito com sucesso.")
+            return True
+        except Exception as e:
+            logger.error(f"Falha ao refazer login: {e}")
+            with self.lock:
+                self.thread_seis[thread_index] = sei
+            return False
 
-                        if success:
-                            with self.lock:
-                                self.progress.update(thread_task, advance=1)
-                                self.progress.update(self.overall_task, advance=1)
-                                completed = self.progress.tasks[self.overall_task].completed
-                                total = self.progress.tasks[self.overall_task].total
+    def _process_from_queue(self, thread_index):
+        """Thread worker que consome processos da fila compartilhada até ela estar vazia."""
+        thread_task = self.thread_tasks[thread_index]
+        processed_count = 0
 
-                            if self.on_progress:
-                                try:
-                                    self.on_progress(completed, total)
-                                except Exception:
-                                    pass
+        if not self._login_with_retry(thread_index):
+            return
 
-                        self.work_queue.task_done()
+        try:
+            with self.lock:
+                self.progress.update(thread_task, visible=True)
 
-                    except queue.Empty:
-                        break
+            while True:
+                if self.stop_event.is_set():
+                    logger.info(f"[Thread {thread_index + 1}] Extração interrompida pelo usuário.")
+                    break
 
-            finally:
-                sei.close()
+                try:
+                    process_number = self.work_queue.get(timeout=1)
+                except queue.Empty:
+                    break
 
-                if processed_count > 0:
+                with self.lock:
+                    current_total_thread = self.progress.tasks[thread_task].total
+                    current_total_overall = self.progress.tasks[self.overall_task].total
+                    self.progress.update(thread_task, total=current_total_thread + 1)
+                    self.progress.update(self.overall_task, total=current_total_overall + 1)
+
+                success = self.process(process_number, thread_index)
+                processed_count += 1
+
+                with self.lock:
+                    self.results[process_number] = success
+
+                if success:
                     with self.lock:
-                        self.progress.update(
-                            thread_task,
-                            description=f"[dim green]Thread {thread_index + 1} (✓ {processed_count})"
-                        )
+                        self.progress.update(thread_task, advance=1)
+                        self.progress.update(self.overall_task, advance=1)
+                        completed = self.progress.tasks[self.overall_task].completed
+                        total = self.progress.tasks[self.overall_task].total
 
-    def process(self, process_number, sei):
-        max_retries = 3
+                    if self.on_progress:
+                        try:
+                            self.on_progress(completed, total)
+                        except Exception:
+                            pass
+
+                self.work_queue.task_done()
+
+        finally:
+            with self.lock:
+                current_sei = self.thread_seis.pop(thread_index, None)
+            if current_sei:
+                self._safe_close_sei(current_sei)
+
+            if processed_count > 0:
+                with self.lock:
+                    self.progress.update(
+                        thread_task,
+                        description=f"[dim green]Thread {thread_index + 1} (✓ {processed_count})"
+                    )
+
+    def process(self, process_number, thread_index):
         delay = 1
         attempt = 0
         output_file = Path(self.json_dir, f"{self.clean_process_number(process_number)}.json")
 
-        while attempt < max_retries:
+        while attempt < self.MAX_ATTEMPTS:
+            if self.stop_event.is_set():
+                return False
+
             attempt += 1
+            with self.lock:
+                sei = self.thread_seis.get(thread_index)
+            if sei is None:
+                return False
+
             try:
                 logger.info(f"Buscando processo {process_number}...")
                 sei.search(process_number)
@@ -838,11 +967,26 @@ class SEIExtractor:
                 logger.info(f"Processo {process_number} extraído com sucesso")
                 return True
             except Exception as e:
-                logger.warning(f"Tentativa {attempt}/{max_retries} falhou para {process_number}: {e}")
-                time.sleep(delay)
-                delay *= 2
+                # Um travamento (elemento/página que nunca responde) também
+                # cai aqui: a página tem um timeout padrão de
+                # PAGE_DEFAULT_TIMEOUT_MS (2 min), então a chamada do
+                # Playwright estoura uma exceção em vez de travar a thread
+                # para sempre.
+                logger.warning(
+                    f"Tentativa {attempt}/{self.MAX_ATTEMPTS} falhou para {process_number} "
+                    f"(possível travamento ou perda de sessão): {e}"
+                )
 
-        logger.error(f"Falha ao extrair {process_number} após {max_retries} tentativas")
+                if self.stop_event.is_set():
+                    return False
+
+                if attempt < self.MAX_ATTEMPTS:
+                    logger.info(f"Refazendo login antes da próxima tentativa de {process_number}...")
+                    self._relogin(thread_index)
+                    time.sleep(delay)
+                    delay *= 2
+
+        logger.error(f"Falha ao extrair {process_number} após {self.MAX_ATTEMPTS} tentativas; passando para o próximo NUP")
         return False
 
     def _append_metadata_csv(self, metadata: dict):
@@ -1255,6 +1399,7 @@ class App(ctk.CTk):
         self._busy_widgets: list = []
         self._busy = False
         self._loaded_nups: List[str] = []
+        self.current_extractor: Optional["SEIExtractor"] = None
 
         self._build_header()
         self._build_body()
@@ -1391,6 +1536,10 @@ class App(ctk.CTk):
                 widget.configure(state=state)
             except Exception:
                 pass
+        try:
+            self.stop_btn.configure(state="normal" if busy else "disabled")
+        except Exception:
+            pass
         self.status_label.configure(text=message, text_color=C_YELLOW if busy else "white")
 
     def run_background(self, target: Callable, busy_message: str, done_message: str = "Pronto"):
@@ -1670,12 +1819,23 @@ class App(ctk.CTk):
         card = ctk.CTkFrame(tab, fg_color="transparent")
         card.pack(fill="x", padx=14, pady=(12, 12))
 
+        buttons_row = ctk.CTkFrame(card, fg_color="transparent")
+        buttons_row.pack(anchor="w")
+
         run_btn = ctk.CTkButton(
-            card, text="Executar extração", fg_color=C_GREEN, hover_color="#0F5C17",
+            buttons_row, text="Executar extração", fg_color=C_GREEN, hover_color="#0F5C17",
             command=self._start_extraction,
         )
-        run_btn.pack(anchor="w")
+        run_btn.pack(side="left")
         self._busy_widgets.append(run_btn)
+
+        # Fica desabilitado quando não há extração em andamento; _set_busy
+        # cuida de habilitar/desabilitar em conjunto com os demais controles.
+        self.stop_btn = ctk.CTkButton(
+            buttons_row, text="Finalizar extração", fg_color=C_RED, hover_color="#8E2E20",
+            command=self._stop_extraction, state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=(8, 0))
 
         self.extract_progress = ctk.CTkProgressBar(card, progress_color=C_ACCENT)
         self.extract_progress.set(0)
@@ -1750,9 +1910,46 @@ class App(ctk.CTk):
                 save_pdf_files=save_pdf_files, save_zip_files=save_zip_files,
                 output_dir=output_dir, threads=threads,
             )
-            extractor.run(processes)
+            self.current_extractor = extractor
+            try:
+                extractor.run(processes)
+            finally:
+                if extractor.stop_event.is_set():
+                    self._generate_stop_report(extractor)
+                self.current_extractor = None
 
         self.run_background(_task, busy_message="Extraindo processos...")
+
+    def _stop_extraction(self):
+        extractor = self.current_extractor
+        if not extractor:
+            return
+
+        if not messagebox.askyesno(
+            "SEI Extractor",
+            "Deseja realmente finalizar a extração?\n\n"
+            "Todas as threads serão interrompidas e um relatório em Excel será "
+            "gerado com os NUPs extraídos e não extraídos.",
+        ):
+            return
+
+        self.log("Finalização solicitada pelo usuário. Interrompendo threads...", level=logging.WARNING)
+        self.stop_btn.configure(state="disabled")
+        extractor.request_stop()
+
+    def _generate_stop_report(self, extractor: "SEIExtractor"):
+        try:
+            df = extractor.build_report_dataframe()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = Path(extractor.output_dir) / f"relatorio_extracao_{timestamp}.xlsx"
+            df.to_excel(report_path, index=False)
+            self.log(f"Relatório de extração gerado em: {report_path}")
+            self.after(0, lambda: messagebox.showinfo(
+                "SEI Extractor",
+                f"Extração finalizada pelo usuário.\nRelatório salvo em:\n{report_path}",
+            ))
+        except Exception as exc:
+            self.log(f"Erro ao gerar relatório de extração: {exc}", level=logging.ERROR)
 
 
 def main():
