@@ -13,7 +13,6 @@ dele para fins de distribuição.
 
 import csv
 import datetime
-import json
 import logging
 import os
 import queue
@@ -65,6 +64,34 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 # carrega) estoure uma exceção em vez de travar indefinidamente.
 PAGE_DEFAULT_TIMEOUT_MS = 120_000
 
+# Flags do Chromium para reduzir CPU/RAM por instância e evitar falhas de
+# lançamento quando muitas rodam em paralelo (ex.: 50 threads = 50 navegadores
+# simultâneos). --disable-dev-shm-usage é o mais importante: sem ele, muitas
+# instâncias concorrentes podem esgotar o /dev/shm (geralmente pequeno) e o
+# Chromium trava/crasha ao iniciar.
+CHROMIUM_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-first-run",
+]
+
+# Tipos de recurso que a página não precisa baixar para navegar/preencher
+# formulários (o SEI não depende de imagens/fontes/mídia para os seletores
+# usados aqui). Bloquear isso reduz bastante o tempo de carregamento e a
+# banda usada por thread — importante com muitas threads em paralelo batendo
+# no mesmo servidor.
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
 LOG_FILE = "sei_extractor.log"
 logger = logging.getLogger("sei_extractor")
 logger.setLevel(logging.INFO)
@@ -81,7 +108,9 @@ console = Console()
 # ==============================================================================
 class DebugDumper:
     def __init__(self, output_dir: str = 'output'):
-        self.output_dir = Path(os.environ.get('OUTPUT_DIR', output_dir))
+        # output_dir explícito (ex.: pasta escolhida pelo usuário na GUI) tem
+        # prioridade sobre a variável de ambiente OUTPUT_DIR.
+        self.output_dir = Path(output_dir or os.environ.get('OUTPUT_DIR', 'output'))
         (self.output_dir / 'debug').mkdir(parents=True, exist_ok=True)
 
     def dump(self, page, tag: str):
@@ -360,20 +389,31 @@ class SEI:
         self._browser = None
         self._page: Optional[Page] = None
         self._headless = headless
-        self._dumper = DebugDumper()
+        self._dumper = DebugDumper(kwargs.get("output_dir", OUTPUT_DIR))
         self._navigator: Optional[Navigator] = None
 
         if self._external_playwright:
-            self._browser = self._p.chromium.launch(headless=self._headless)
+            self._browser = self._p.chromium.launch(headless=self._headless, args=CHROMIUM_LAUNCH_ARGS)
             self._page = self._browser.new_page()
-            self._apply_default_timeouts()
+            self._apply_page_optimizations()
             self._navigator = Navigator(self._page, debug=self._debug, dumper=self._dumper)
 
-    def _apply_default_timeouts(self):
-        # Sem isso, uma ação do Playwright sem timeout explícito (ex.: click,
-        # wait_for_load_state) pode travar a thread indefinidamente.
+    def _apply_page_optimizations(self):
+        # Sem timeout padrão, uma ação do Playwright sem timeout explícito
+        # (ex.: click, wait_for_load_state) pode travar a thread indefinidamente.
         self._page.set_default_timeout(PAGE_DEFAULT_TIMEOUT_MS)
         self._page.set_default_navigation_timeout(PAGE_DEFAULT_TIMEOUT_MS)
+
+        # Imagens/fontes/mídia não são necessárias para nenhum seletor usado
+        # neste scraper; abortar esses pedidos acelera a navegação e reduz a
+        # carga por thread (relevante com muitas threads em paralelo).
+        def _route_handler(route):
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+                route.abort()
+            else:
+                route.continue_()
+
+        self._page.route("**/*", _route_handler)
 
     @property
     def current_url(self) -> str:
@@ -383,9 +423,9 @@ class SEI:
         if self._page:
             return
         self._p = sync_playwright().start()
-        self._browser = self._p.chromium.launch(headless=self._headless, args=["--no-sandbox"])
+        self._browser = self._p.chromium.launch(headless=self._headless, args=CHROMIUM_LAUNCH_ARGS)
         self._page = self._browser.new_page()
-        self._apply_default_timeouts()
+        self._apply_page_optimizations()
         self._navigator = Navigator(self._page, debug=self._debug, dumper=self._dumper)
 
     def close(self):
@@ -398,6 +438,10 @@ class SEI:
                     self._p.stop()
                 except Exception:
                     pass
+
+    def dump_debug(self, tag: str):
+        """Salva um screenshot + HTML da página atual, para diagnosticar uma falha."""
+        return self._dumper.dump(self._page, tag)
 
     def do_login(self):
         """Log in to SEI using site selectors."""
@@ -515,15 +559,30 @@ class SEI:
 
     def search(self, value: str):
         self._ensure_browser()
-        self._page.locator('xpath=//*[@id="txtPesquisaRapida"]').fill(value)
-        self._page.locator('#spnInfraUnidade').click()
-        if self._debug:
-            try:
-                self._page.keyboard.press('Enter')
-            except Exception:
-                pass
         if not self._navigator:
             self._navigator = Navigator(self._page, debug=self._debug, dumper=self._dumper)
+
+        self._page.locator('xpath=//*[@id="txtPesquisaRapida"]').fill(value)
+
+        # #ifrConteudoVisualizacao é um iframe fixo do layout (existe o tempo
+        # todo; só o conteúdo dele muda a cada busca). Sem esperar por uma
+        # navegação NOVA nesse frame antes de seguir, o click_consultar_processo
+        # logo abaixo podia clicar num link que ainda era da busca ANTERIOR
+        # (a troca de conteúdo não tinha começado/terminado ainda), fazendo o
+        # script ficar "grudado" no processo anterior por várias tentativas
+        # seguintes sem nenhum erro aparente.
+        with self._page.expect_event(
+            "framenavigated",
+            predicate=lambda frame: frame.name == "ifrConteudoVisualizacao",
+            timeout=PAGE_DEFAULT_TIMEOUT_MS,
+        ):
+            self._page.locator('#spnInfraUnidade').click()
+            if self._debug:
+                try:
+                    self._page.keyboard.press('Enter')
+                except Exception:
+                    pass
+
         self._navigator.click_consultar_processo()
 
     def get_metadados(self, numero_processo: str) -> dict:
@@ -662,11 +721,11 @@ class SEI:
 # Extractor
 # ==============================================================================
 class SEIExtractor:
-    # Número máximo de tentativas por NUP (incluindo travamentos, que são
-    # tratados como uma falha normal graças ao PAGE_DEFAULT_TIMEOUT_MS).
-    # Após esgotar as tentativas, o NUP é abandonado e a thread segue para o
-    # próximo item da fila.
-    MAX_ATTEMPTS = 3
+    # Número máximo de tentativas de LOGIN (abrir navegador + autenticar) de
+    # uma thread ao iniciar. Não tem relação com falhas ao extrair um NUP
+    # específico (ver `run`/`_run_pass`: cada NUP recebe no máximo uma
+    # tentativa por rodada, com uma única rodada extra de retry no final).
+    MAX_LOGIN_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -674,7 +733,7 @@ class SEIExtractor:
         url: Optional[str] = None,
         user: Optional[str] = None,
         passw: Optional[str] = None,
-        sigla: Optional[str] = None,
+        siglas: Optional[List[str]] = None,
         save_pdf_files: bool = False,
         save_zip_files: bool = False,
         output_dir: Optional[str] = None,
@@ -683,17 +742,17 @@ class SEIExtractor:
         self.url = url or SEI_URL
         self.user = user or SEI_USERNAME
         self.passw = passw or SEI_PASSWORD
-        self.sigla = sigla or ""
+        # Unidades a tentar, em ordem, para cada NUP: falhou na 1ª, troca para
+        # a 2ª e tenta de novo, e assim por diante. Sem unidades configuradas,
+        # é feita uma única tentativa na unidade atualmente ativa da conta.
+        self.siglas: List[str] = [s for s in (siglas or []) if s]
         self.save_pdf_files = save_pdf_files
         self.save_zip_files = save_zip_files
         self.threads = threads if threads and threads > 0 else THREADS
 
         self.output_dir = output_dir or OUTPUT_DIR
-        self.json_dir = os.path.join(self.output_dir, "json")
         self.pdf_dir = os.path.join(self.output_dir, "pdfs")
         self.zip_dir = os.path.join(self.output_dir, "zips")
-        self.metadata_csv = os.path.join(self.output_dir, "metadata.csv")
-        os.makedirs(self.json_dir, exist_ok=True)
         os.makedirs(self.pdf_dir, exist_ok=True)
         os.makedirs(self.zip_dir, exist_ok=True)
 
@@ -731,11 +790,32 @@ class SEIExtractor:
             threading.Thread(target=self._safe_close_sei, args=(sei,), daemon=True).start()
 
     @staticmethod
-    def _safe_close_sei(sei):
-        try:
-            sei.close()
-        except Exception:
-            pass
+    def _safe_close_sei(sei, timeout: float = 10.0):
+        """Fecha a sessão sem travar para sempre.
+
+        browser.close()/playwright.stop() não têm timeout embutido e já
+        travaram indefinidamente nesta ferramenta (a extração parava sem
+        gerar nenhum log e nunca terminava). Roda o close numa thread à
+        parte e desiste de esperar após `timeout`; o processo do navegador
+        pode ficar órfão nesse caso, mas a extração/relatório não ficam
+        reféns disso.
+        """
+        done = threading.Event()
+
+        def _close():
+            try:
+                sei.close()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_close, daemon=True).start()
+        if not done.wait(timeout):
+            logger.warning(
+                "Fechar o navegador demorou demais; seguindo em frente sem esperar "
+                "(o processo do navegador pode continuar em segundo plano)."
+            )
 
     def build_report_dataframe(self) -> pd.DataFrame:
         """Monta o relatório com todos os NUPs solicitados e se foram extraídos."""
@@ -746,25 +826,21 @@ class SEIExtractor:
         return pd.DataFrame(rows)
 
     def run(self, process_numbers):
-        """Processa usando uma fila compartilhada - threads pegam trabalho dinamicamente (work stealing)."""
-        self.work_queue = queue.Queue()
+        """Processa a lista de NUPs uma única vez.
+
+        A recuperação de falhas acontece dentro de `process`: cada NUP é
+        tentado em cada unidade configurada (self.siglas), nessa ordem, até
+        conseguir ou esgotar as unidades — sem uma rodada extra sobre a lista
+        inteira ao final.
+        """
         self.stop_event.clear()
         self.original_process_numbers = list(process_numbers)
-        self.results = {}
+        # Sem controle de "já extraído": toda execução tenta todos os NUPs da
+        # lista, mesmo que já tenham sido extraídos numa execução anterior.
+        self.results = {process_num: False for process_num in process_numbers}
+        pending = list(process_numbers)
 
-        for process_num in process_numbers:
-            output_file = Path(self.json_dir, f"{self.clean_process_number(process_num)}.json")
-
-            if output_file.exists():
-                self.results[process_num] = True
-            else:
-                self.results[process_num] = False
-                self.work_queue.put(process_num)
-
-        # Não abre mais threads do que processos pendentes: buscar 1 processo
-        # não precisa logar 10 vezes no SEI.
-        num_threads = max(1, min(self.threads, self.work_queue.qsize()))
-        logger.info(f"Iniciando extração de {len(process_numbers)} processo(s) com {num_threads} thread(s)")
+        logger.info(f"Iniciando extração de {len(process_numbers)} processo(s)")
 
         with Progress(
             SpinnerColumn(),
@@ -777,11 +853,37 @@ class SEIExtractor:
             transient=False,
         ) as progress:
             self.progress = progress
-
             self.overall_task = progress.add_task("[cyan]Total Progress", total=0)
 
+            failed = self._run_pass(pending)
+
+            if failed:
+                logger.error(
+                    f"{len(failed)} processo(s) não puderam ser extraídos: {', '.join(failed)}"
+                )
+
+        logger.info("Extração concluída")
+
+    def _run_pass(self, process_numbers: List[str]) -> List[str]:
+        """Roda um pool de threads que fazem login uma vez e consomem uma
+        fila compartilhada com `process_numbers`.
+
+        Retorna os NUPs que continuam sem ser extraídos ao final (nada é
+        tentado se a extração já foi interrompida).
+        """
+        if process_numbers and not self.stop_event.is_set():
+            self.work_queue = queue.Queue()
+            for process_num in process_numbers:
+                self.work_queue.put(process_num)
+
+            # Não abre mais threads do que processos pendentes: buscar 1
+            # processo não precisa logar 10 vezes no SEI.
+            num_threads = max(1, min(self.threads, self.work_queue.qsize()))
+            logger.info(f"Processando {len(process_numbers)} processo(s) com {num_threads} thread(s)")
+
+            self.thread_tasks = {}
             for i in range(num_threads):
-                thread_task = progress.add_task(
+                thread_task = self.progress.add_task(
                     f"[green]Thread {i + 1}",
                     total=0,
                     visible=False,
@@ -796,7 +898,7 @@ class SEIExtractor:
                 for future in futures:
                     future.result()
 
-        logger.info("Extração concluída")
+        return [nup for nup in process_numbers if not self.results.get(nup)]
 
     def _login_with_retry(self, thread_index: int) -> bool:
         """Abre navegador e faz login, tentando novamente em caso de falha/travamento.
@@ -804,22 +906,19 @@ class SEIExtractor:
         Cada tentativa cria um navegador novo (a anterior, se travada, já
         estourou uma exceção graças ao PAGE_DEFAULT_TIMEOUT_MS da página).
         """
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.MAX_LOGIN_ATTEMPTS + 1):
             if self.stop_event.is_set():
                 return False
 
-            sei = SEI(self.url, self.user, self.passw, headless=HEADLESS)
+            sei = SEI(self.url, self.user, self.passw, headless=HEADLESS, output_dir=self.output_dir)
             try:
                 logger.info(
                     f"[Thread {thread_index + 1}] Abrindo navegador e fazendo login em "
-                    f"{self.url}... (tentativa {attempt}/{self.MAX_ATTEMPTS})"
+                    f"{self.url}... (tentativa {attempt}/{self.MAX_LOGIN_ATTEMPTS})"
                 )
                 sei.do_login()
-
-                if self.sigla:
-                    # select_unidade já loga o resultado (trocou, não precisou
-                    # trocar, ou não encontrou a unidade), sem precisar duplicar aqui.
-                    sei.select_unidade(self.sigla)
+                # A troca de unidade (quando há mais de uma configurada) é
+                # feita por tentativa dentro de `process`, não aqui.
 
                 with self.lock:
                     self.thread_seis[thread_index] = sei
@@ -828,35 +927,13 @@ class SEIExtractor:
             except Exception as e:
                 logger.warning(
                     f"[Thread {thread_index + 1}] Falha ao fazer login "
-                    f"(tentativa {attempt}/{self.MAX_ATTEMPTS}): {e}"
+                    f"(tentativa {attempt}/{self.MAX_LOGIN_ATTEMPTS}): {e}"
                 )
                 self._safe_close_sei(sei)
                 time.sleep(2)
 
-        logger.error(f"[Thread {thread_index + 1}] Não foi possível fazer login após {self.MAX_ATTEMPTS} tentativas.")
+        logger.error(f"[Thread {thread_index + 1}] Não foi possível fazer login após {self.MAX_LOGIN_ATTEMPTS} tentativas.")
         return False
-
-    def _relogin(self, thread_index: int) -> bool:
-        """Fecha a sessão atual da thread (se houver) e faz login novamente."""
-        with self.lock:
-            old_sei = self.thread_seis.get(thread_index)
-        if old_sei:
-            self._safe_close_sei(old_sei)
-
-        sei = SEI(self.url, self.user, self.passw, headless=HEADLESS)
-        try:
-            sei.do_login()
-            if self.sigla:
-                sei.select_unidade(self.sigla)
-            with self.lock:
-                self.thread_seis[thread_index] = sei
-            logger.info("Login refeito com sucesso.")
-            return True
-        except Exception as e:
-            logger.error(f"Falha ao refazer login: {e}")
-            with self.lock:
-                self.thread_seis[thread_index] = sei
-            return False
 
     def _process_from_queue(self, thread_index):
         """Thread worker que consome processos da fila compartilhada até ela estar vazia."""
@@ -886,7 +963,16 @@ class SEIExtractor:
                     self.progress.update(thread_task, total=current_total_thread + 1)
                     self.progress.update(self.overall_task, total=current_total_overall + 1)
 
-                success = self.process(process_number, thread_index)
+                try:
+                    success = self.process(process_number, thread_index)
+                except Exception as e:
+                    # Rede de segurança: nenhum erro ao processar UM NUP pode
+                    # derrubar a extração inteira (já aconteceu com uma
+                    # exceção não tratada em select_unidade — process() já
+                    # foi corrigido, mas isso protege contra qualquer outro
+                    # caso não previsto no futuro).
+                    logger.error(f"Erro inesperado ao processar {process_number}: {e}")
+                    success = False
                 processed_count += 1
 
                 with self.lock:
@@ -921,24 +1007,37 @@ class SEIExtractor:
                     )
 
     def process(self, process_number, thread_index):
-        delay = 1
-        attempt = 0
-        output_file = Path(self.json_dir, f"{self.clean_process_number(process_number)}.json")
+        """Tenta extrair `process_number`, alternando entre as unidades
+        configuradas (self.siglas, em ordem) a cada falha.
 
-        while attempt < self.MAX_ATTEMPTS:
+        Sem unidades configuradas: uma única tentativa na unidade atual.
+        Com N unidades configuradas: até N tentativas, uma por unidade,
+        nessa ordem. Cada falha (incluindo travamentos, que a página
+        transforma em exceção após PAGE_DEFAULT_TIMEOUT_MS) tira um
+        screenshot de diagnóstico antes de trocar de unidade; ao esgotar as
+        unidades, desiste do NUP — sem tentativas extras além dessas.
+        """
+        with self.lock:
+            sei = self.thread_seis.get(thread_index)
+        if sei is None:
+            return False
+
+        unidades = self.siglas or [None]
+
+        for indice, unidade in enumerate(unidades):
             if self.stop_event.is_set():
                 return False
 
-            attempt += 1
-            with self.lock:
-                sei = self.thread_seis.get(thread_index)
-            if sei is None:
-                return False
-
             try:
-                logger.info(f"Buscando processo {process_number}...")
+                if unidade and not sei.select_unidade(unidade):
+                    logger.warning(f"Não foi possível confirmar a troca para a unidade '{unidade}'; tentando mesmo assim.")
+
+                logger.info(f"Buscando processo {process_number}" + (f" (unidade: {unidade})" if unidade else "") + "...")
                 sei.search(process_number)
-                metadata = sei.get_metadados(process_number)
+                # Não chama mais get_metadados: nada do que ela raspa
+                # (assunto, interessados etc.) é salvo em disco, e o clique
+                # de save_pdf/save_zip abaixo já espera sozinho (auto-wait do
+                # Playwright) a tela do processo carregar antes de agir.
 
                 if self.save_pdf_files:
                     try:
@@ -956,330 +1055,29 @@ class SEIExtractor:
                     except Exception as e:
                         logger.warning(f"Falha ao salvar ZIP de {process_number}: {e}")
 
-                historico_andamento = sei.get_historico()
-                metadata['historico_andamento'] = historico_andamento
-
-                with open(output_file, "w") as f:
-                    json.dump(metadata, f, indent=4, default=str)
-
-                self._append_metadata_csv(metadata)
-
-                logger.info(f"Processo {process_number} extraído com sucesso")
+                logger.info(f"Processo {process_number} extraído com sucesso" + (f" (unidade: {unidade})" if unidade else ""))
                 return True
             except Exception as e:
-                # Um travamento (elemento/página que nunca responde) também
-                # cai aqui: a página tem um timeout padrão de
-                # PAGE_DEFAULT_TIMEOUT_MS (2 min), então a chamada do
-                # Playwright estoura uma exceção em vez de travar a thread
-                # para sempre.
                 logger.warning(
-                    f"Tentativa {attempt}/{self.MAX_ATTEMPTS} falhou para {process_number} "
-                    f"(possível travamento ou perda de sessão): {e}"
+                    f"Falha ao extrair {process_number}" + (f" na unidade '{unidade}'" if unidade else "") + f": {e}"
                 )
-
-                if self.stop_event.is_set():
-                    return False
-
-                if attempt < self.MAX_ATTEMPTS:
-                    logger.info(f"Refazendo login antes da próxima tentativa de {process_number}...")
-                    self._relogin(thread_index)
-                    time.sleep(delay)
-                    delay *= 2
-
-        logger.error(f"Falha ao extrair {process_number} após {self.MAX_ATTEMPTS} tentativas; passando para o próximo NUP")
-        return False
-
-    def _append_metadata_csv(self, metadata: dict):
-        protocolo = metadata.get('protocolo')
-        tipo = metadata.get('tipo_procedimento', {}).get('nome') if metadata.get('tipo_procedimento') else ''
-        assunto_count = len(metadata.get('assunto') or [])
-        interessados_count = len(metadata.get('interessados') or [])
-        row = [protocolo, tipo, assunto_count, interessados_count]
-
-        write_header = not os.path.exists(self.metadata_csv)
-        with open(self.metadata_csv, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            if write_header:
-                writer.writerow(['protocolo', 'tipo_procedimento', 'assunto_count', 'interessados_count'])
-            writer.writerow(row)
-
-
-# ==============================================================================
-# Services: conversão JSON -> CSV
-# ==============================================================================
-class JSONToCSVService:
-    """Service para converter JSONs do SEI em CSV consolidado usando pandas."""
-
-    def __init__(self):
-        self.errors = []
-
-    def flatten_list_field(self, items: List[Dict], prefix: str) -> Dict[str, Any]:
-        """Achata uma lista de objetos em campos separados, mantendo todos os dados."""
-        result = {}
-        if not items:
-            result[f"{prefix}_count"] = 0
-            result[f"{prefix}_completo_json"] = '[]'
-            return result
-
-        result[f"{prefix}_count"] = len(items)
-
-        if all(isinstance(item, dict) for item in items):
-            names = []
-            ids = []
-            for item in items:
-                if 'nome' in item:
-                    names.append(str(item['nome']))
-                if 'id' in item:
-                    ids.append(str(item['id']))
-
-            if names:
-                result[f"{prefix}_nomes"] = " | ".join(names)
-            if ids:
-                result[f"{prefix}_ids"] = " | ".join(ids)
-        else:
-            result[f"{prefix}_valores"] = " | ".join(str(item) for item in items)
-
-        result[f"{prefix}_completo_json"] = json.dumps(items, ensure_ascii=False)
-
-        return result
-
-    def process_historico(self, historico: List[Dict]) -> Dict[str, Any]:
-        """Processa o histórico de andamento - mantém todos os dados."""
-        if not historico:
-            return {
-                'historico_count': 0,
-                'historico_primeiro_evento': '',
-                'historico_ultimo_evento': '',
-                'historico_data_primeiro': '',
-                'historico_data_ultimo': '',
-                'historico_unidades_envolvidas': '',
-                'historico_completo_json': '[]'
-            }
-
-        historico_sorted = sorted(
-            historico,
-            key=lambda x: x.get('criado_em', ''),
-            reverse=True
-        )
-
-        unidades = list(set(h.get('unidade', '') for h in historico if h.get('unidade')))
-
-        return {
-            'historico_count': len(historico),
-            'historico_primeiro_evento': historico_sorted[-1].get('descricao', '')[:200] if historico_sorted else '',
-            'historico_ultimo_evento': historico_sorted[0].get('descricao', '')[:200] if historico_sorted else '',
-            'historico_data_primeiro': historico_sorted[-1].get('criado_em', '') if historico_sorted else '',
-            'historico_data_ultimo': historico_sorted[0].get('criado_em', '') if historico_sorted else '',
-            'historico_unidades_envolvidas': " | ".join(sorted(unidades)),
-            'historico_completo_json': json.dumps(historico, ensure_ascii=False)
-        }
-
-    def process_observacoes(self, observacoes: List[Dict]) -> Dict[str, Any]:
-        """Processa observações - mantém todos os dados."""
-        if not observacoes:
-            return {
-                'observacoes_count': 0,
-                'observacoes_texto': '',
-                'observacoes_completo_json': '[]'
-            }
-
-        textos = []
-        for obs in observacoes:
-            unidade = obs.get('unidade', 'N/A')
-            texto = obs.get('observacao', '')
-            textos.append(f"[{unidade}] {texto}")
-
-        return {
-            'observacoes_count': len(observacoes),
-            'observacoes_texto': " | ".join(textos),
-            'observacoes_completo_json': json.dumps(observacoes, ensure_ascii=False)
-        }
-
-    def process_anexos(self, anexos: List[Dict]) -> Dict[str, Any]:
-        """Processa anexos - mantém todos os dados."""
-        if not anexos:
-            return {
-                'anexos_count': 0,
-                'anexos_nomes': '',
-                'anexos_completo_json': '[]'
-            }
-
-        nomes = [f"{a.get('nome', 'N/A')} ({a.get('unidade', 'N/A')})" for a in anexos]
-
-        return {
-            'anexos_count': len(anexos),
-            'anexos_nomes': " | ".join(nomes),
-            'anexos_completo_json': json.dumps(anexos, ensure_ascii=False)
-        }
-
-    def json_to_flat_dict(self, data: Dict) -> Dict[str, Any]:
-        """Converte JSON complexo em dicionário plano para DataFrame."""
-        flat = {}
-
-        flat['protocolo'] = data.get('protocolo', '')
-        flat['especificacao'] = data.get('especificacao', '')
-
-        tipo = data.get('tipo_procedimento', {})
-        if tipo:
-            flat['tipo_procedimento_id'] = tipo.get('id', '')
-            flat['tipo_procedimento_nome'] = tipo.get('nome', '')
-            flat['tipo_procedimento_completo_json'] = json.dumps(tipo, ensure_ascii=False)
-        else:
-            flat['tipo_procedimento_id'] = ''
-            flat['tipo_procedimento_nome'] = ''
-            flat['tipo_procedimento_completo_json'] = '{}'
-
-        assuntos = data.get('assunto', [])
-        flat.update(self.flatten_list_field(assuntos, 'assunto'))
-
-        interessados = data.get('interessados', [])
-        flat.update(self.flatten_list_field(interessados, 'interessado'))
-
-        flat.update(self.process_observacoes(data.get('observacoes', [])))
-        flat.update(self.process_anexos(data.get('anexos', [])))
-        flat.update(self.process_historico(data.get('historico_andamento', [])))
-
-        return flat
-
-    def convert_jsons_to_dataframe(
-        self,
-        json_dir: Path,
-        show_progress: bool = True
-    ) -> Optional[pd.DataFrame]:
-        """Converte todos os JSONs de um diretório para um DataFrame pandas."""
-        json_files = list(json_dir.glob('*.json'))
-
-        if not json_files:
-            console.print(f"[red]❌ Nenhum arquivo JSON encontrado em: {json_dir}[/red]")
-            return None
-
-        all_rows = []
-        self.errors = []
-
-        if show_progress:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn(),
-                console=console
-            ) as progress:
-                task = progress.add_task(
-                    f"[cyan]Processando {len(json_files)} arquivos JSON...",
-                    total=len(json_files)
-                )
-
-                for json_file in json_files:
-                    try:
-                        with open(json_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-
-                        flat_data = self.json_to_flat_dict(data)
-                        all_rows.append(flat_data)
-
-                    except Exception as e:
-                        self.errors.append(f"{json_file.name}: {str(e)}")
-
-                    progress.update(task, advance=1)
-        else:
-            for json_file in json_files:
+                tag = f"falha_{self.clean_process_number(process_number)}" + (f"_{unidade}" if unidade else "")
                 try:
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                    debug_path = sei.dump_debug(tag)
+                    if debug_path:
+                        logger.info(f"Screenshot da falha salvo em: {debug_path}.png")
+                except Exception:
+                    pass
 
-                    flat_data = self.json_to_flat_dict(data)
-                    all_rows.append(flat_data)
+                is_ultima_unidade = indice == len(unidades) - 1
+                if is_ultima_unidade:
+                    logger.error(
+                        f"Falha ao extrair {process_number} em todas as unidades tentadas; desistindo deste NUP."
+                    )
+                    return False
+                # Senão, o loop segue para a próxima unidade configurada.
 
-                except Exception as e:
-                    self.errors.append(f"{json_file.name}: {str(e)}")
-
-        if not all_rows:
-            console.print("[red]❌ Nenhum dado válido encontrado[/red]")
-            return None
-
-        df = pd.DataFrame(all_rows)
-
-        ordered_cols = self._order_columns(df.columns.tolist())
-        df = df[ordered_cols]
-
-        return df
-
-    def _order_columns(self, columns: List[str]) -> List[str]:
-        """Ordena as colunas de forma lógica."""
-        ordered = []
-        remaining = set(columns)
-
-        main_fields = ['protocolo', 'especificacao', 'tipo_procedimento_id', 'tipo_procedimento_nome']
-        for field in main_fields:
-            if field in remaining:
-                ordered.append(field)
-                remaining.remove(field)
-
-        for prefix in ['assunto', 'interessado', 'observacoes', 'anexos', 'historico']:
-            prefix_cols = sorted([c for c in remaining if c.startswith(prefix)])
-            ordered.extend(prefix_cols)
-            remaining -= set(prefix_cols)
-
-        ordered.extend(sorted(remaining))
-
-        return ordered
-
-    def save_to_csv(
-        self,
-        df: pd.DataFrame,
-        output_path: Path,
-        show_progress: bool = True
-    ) -> bool:
-        """Salva DataFrame em CSV."""
-        try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if show_progress:
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console
-                ) as progress:
-                    task = progress.add_task("[cyan]Salvando CSV...", total=None)
-                    df.to_csv(output_path, index=False, encoding='utf-8-sig')
-                    progress.update(task, completed=True)
-            else:
-                df.to_csv(output_path, index=False, encoding='utf-8-sig')
-
-            return True
-
-        except Exception as e:
-            console.print(f"[red]❌ Erro ao salvar CSV: {e}[/red]")
-            return False
-
-    def convert_and_save(
-        self,
-        json_dir: Path,
-        output_csv: Path,
-        show_progress: bool = True
-    ) -> bool:
-        """Converte JSONs para CSV em um único processo."""
-        df = self.convert_jsons_to_dataframe(json_dir, show_progress=show_progress)
-
-        if df is None:
-            return False
-
-        success = self.save_to_csv(df, output_csv, show_progress=show_progress)
-
-        if success:
-            console.print(f"\n[green]✅ CSV criado com sucesso: {output_csv}[/green]")
-            console.print(f"[green]📊 Total de processos: {len(df)}[/green]")
-            console.print(f"[green]📋 Total de colunas: {len(df.columns)}[/green]")
-
-            if self.errors:
-                console.print(f"\n[yellow]⚠️  Erros encontrados ({len(self.errors)}):[/yellow]")
-                for error in self.errors[:10]:
-                    console.print(f"  [dim]- {error}[/dim]")
-                if len(self.errors) > 10:
-                    console.print(f"  [dim]... e mais {len(self.errors) - 10} erros[/dim]")
-
-        return success
+        return False
 
 
 # ==============================================================================
@@ -1610,14 +1408,36 @@ class App(ctk.CTk):
             checkbox_height=18,
         ).grid(row=3, column=2, sticky="w", padx=8)
 
-        ctk.CTkLabel(card, text="Sigla da unidade:").grid(row=4, column=0, sticky="w", padx=14, pady=(6, 14))
-        self.sigla_entry = ctk.CTkEntry(card, width=320, placeholder_text="ex.: SE/MS")
-        self.sigla_entry.grid(row=4, column=1, sticky="w", padx=8, pady=(6, 14))
+        ctk.CTkLabel(card, text="Unidades (uma por linha,\nna ordem de tentativa):").grid(
+            row=4, column=0, sticky="nw", padx=14, pady=(6, 14)
+        )
+        self.siglas_textbox = ctk.CTkTextbox(card, width=320, height=80)
+        self.siglas_textbox.insert("1.0", "CGCER\nCGPROF\nCGAGIC")
+        self.siglas_textbox.grid(row=4, column=1, sticky="w", padx=8, pady=(6, 14))
+        ctk.CTkLabel(
+            card,
+            text="Se um NUP falhar numa unidade, tenta a próxima da lista antes de desistir.\n"
+                 "Deixe em branco para usar sempre a unidade atual da conta.",
+            font=ctk.CTkFont(size=11),
+            text_color=C_MUTED,
+            justify="left",
+        ).grid(row=5, column=1, sticky="w", padx=8, pady=(0, 14))
 
         # url_entry fica de fora: é somente leitura (URL do SEI é fixa) e não
         # deve ser reabilitada pelo controle de "ocupado" (_busy_widgets).
-        for widget in (self.user_entry, self.password_entry, self.sigla_entry):
+        for widget in (self.user_entry, self.password_entry, self.siglas_textbox):
             self._busy_widgets.append(widget)
+
+    def _get_siglas(self) -> List[str]:
+        """Lê as unidades digitadas (uma por linha), na ordem informada,
+        ignorando linhas em branco e duplicatas."""
+        texto = self.siglas_textbox.get("1.0", "end")
+        siglas: List[str] = []
+        for linha in texto.splitlines():
+            valor = linha.strip()
+            if valor and valor not in siglas:
+                siglas.append(valor)
+        return siglas
 
     def _toggle_password_visibility(self):
         self.password_entry.configure(show="" if self.show_password_var.get() else "*")
@@ -1869,7 +1689,7 @@ class App(ctk.CTk):
         url = self.url_entry.get().strip()
         user = self.user_entry.get().strip()
         passw = self.password_entry.get().strip()
-        sigla = self.sigla_entry.get().strip()
+        siglas = self._get_siglas()
         output_dir = self.output_dir_entry.get().strip()
 
         if not url or not user or not passw:
@@ -1889,7 +1709,7 @@ class App(ctk.CTk):
 
         self.log(
             f"Iniciando extração de {len(processes)} processo(s) com {threads} thread(s)"
-            + (f" na unidade '{sigla}'" if sigla else "")
+            + (f" nas unidades {', '.join(siglas)}" if siglas else "")
             + (" [PDF]" if save_pdf_files else "")
             + (" [ZIP]" if save_zip_files else "")
             + f" em '{output_dir}'"
@@ -1906,16 +1726,29 @@ class App(ctk.CTk):
 
         def _task():
             extractor = SEIExtractor(
-                on_progress=_on_progress, url=url, user=user, passw=passw, sigla=sigla,
+                on_progress=_on_progress, url=url, user=user, passw=passw, siglas=siglas,
                 save_pdf_files=save_pdf_files, save_zip_files=save_zip_files,
                 output_dir=output_dir, threads=threads,
             )
             self.current_extractor = extractor
+            crash_error = None
             try:
                 extractor.run(processes)
+            except Exception as exc:
+                crash_error = exc
+                self.log(f"Extração interrompida por um erro inesperado: {exc}", level=logging.ERROR)
             finally:
-                if extractor.stop_event.is_set():
-                    self._generate_stop_report(extractor)
+                # O caminho de "Finalizar extração" já gera o relatório na
+                # hora (extractor.stop_event fica marcado); aqui cobre os
+                # outros dois casos em que run() termina sem passar por lá:
+                # conclusão normal e crash não tratado.
+                if not extractor.stop_event.is_set():
+                    reason = (
+                        f"Extração interrompida por um erro inesperado ({crash_error})."
+                        if crash_error is not None
+                        else "Extração concluída."
+                    )
+                    self._generate_extraction_report(extractor, reason)
                 self.current_extractor = None
 
         self.run_background(_task, busy_message="Extraindo processos...")
@@ -1936,8 +1769,13 @@ class App(ctk.CTk):
         self.log("Finalização solicitada pelo usuário. Interrompendo threads...", level=logging.WARNING)
         self.stop_btn.configure(state="disabled")
         extractor.request_stop()
+        # Gera o relatório já aqui, sem esperar as threads terminarem: fechar
+        # o navegador (dentro de request_stop) pode travar em alguns casos
+        # (ex.: download pendente), e esperar `run()` retornar deixaria o
+        # relatório refém disso. self.results já reflete o estado atual.
+        self._generate_extraction_report(extractor, "Extração finalizada pelo usuário.")
 
-    def _generate_stop_report(self, extractor: "SEIExtractor"):
+    def _generate_extraction_report(self, extractor: "SEIExtractor", reason: str):
         try:
             df = extractor.build_report_dataframe()
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1946,7 +1784,7 @@ class App(ctk.CTk):
             self.log(f"Relatório de extração gerado em: {report_path}")
             self.after(0, lambda: messagebox.showinfo(
                 "SEI Extractor",
-                f"Extração finalizada pelo usuário.\nRelatório salvo em:\n{report_path}",
+                f"{reason}\nRelatório salvo em:\n{report_path}",
             ))
         except Exception as exc:
             self.log(f"Erro ao gerar relatório de extração: {exc}", level=logging.ERROR)
